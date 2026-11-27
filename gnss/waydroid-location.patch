@@ -1,0 +1,105 @@
+--- a/gnss/aidl/default/GnssDebug.cpp
++++ b/gnss/aidl/default/GnssDebug.cpp
+@@ -17,8 +17,9 @@
+ #define LOG_TAG "GnssDebugAidl"
+
+ #include "GnssDebug.h"
+ #include <log/log.h>
++#include <utils/Timers.h>
+ #include "MockLocation.h"
+
+ namespace aidl::android::hardware::gnss {
+
+@@ -35,9 +36,9 @@
+                                    .verticalAccuracyMeters = 5,
+                                    .speedAccuracyMetersPerSecond = 1,
+                                    .bearingAccuracyDegrees = 90,
+                                    .ageSeconds = 0.99};
+-    TimeDebug timeDebug = {.timeEstimateMs = 1519930775453L,
++    TimeDebug timeDebug = {.timeEstimateMs = nanoseconds_to_milliseconds(systemTime(SYSTEM_TIME_REALTIME)),
+                            .timeUncertaintyNs = 1000,
+                            .frequencyUncertaintyNsPerSec = 5.0e4};
+     std::vector<SatelliteData> satelliteDataArrayDebug = {};
+     debugData->position = positionDebug;
+--- a/gnss/common/utils/default/Utils.cpp
++++ b/gnss/common/utils/default/Utils.cpp
+@@ -15,8 +15,14 @@
+  */
+
+ #include <Constants.h>
+ #include <MockLocation.h>
++#include <ParseUtils.h>
++#include <cutils/properties.h>
++#include <cmath>
++#include <cstdlib>
++#include <limits>
++#include <utils/Timers.h>
+ #include <Utils.h>
+ #include <aidl/android/hardware/gnss/BnGnss.h>
+ #include <utils/SystemClock.h>
+
+@@ -261,8 +267,37 @@
+                          .gnssAgcs = std::vector({gnssAgc1, gnssAgc2})};
+     return gnssData;
+ }
+
++// The property describes a stationary or moving position, not a recorded fix.
++// Read it for each sample so changes also reach the AIDL batching path.
++static void applyWaydroidPosition(GnssLocation& location) {
++    char value[PROPERTY_VALUE_MAX];
++    if (property_get("persist.waydroid.fake_gps", value, nullptr) <= 0) return;
++    std::vector<std::string> fields;
++    ParseUtils::splitStr(value, ',', fields);
++    if (fields.size() < 8 || fields[0] != "Fix" || fields[1] != "gps") return;
++
++    // Accept the original eight-field format as well as complete GNSS Logger
++    // rows. Accuracy and clocks are supplied by the live GNSS provider.
++    auto number = [&](size_t field) {
++        const char* first = fields[field].c_str();
++        char* end;
++        double result = std::strtod(first, &end);
++        return end != first && *end == '\0' ? result : NAN;
++    };
++    const double latitude = number(2), longitude = number(3), altitude = number(4);
++    const double speed = number(5), bearing = number(7);
++    if (!(std::abs(latitude) <= 90 && std::abs(longitude) <= 180 &&
++          std::isfinite(altitude) && speed >= 0 && speed <= std::numeric_limits<float>::max() &&
++          bearing >= 0 && bearing <= 360)) return;
++    location.latitudeDegrees = latitude;
++    location.longitudeDegrees = longitude;
++    location.altitudeMeters = altitude;
++    location.speedMetersPerSec = speed;
++    location.bearingDegrees = bearing;
++}
++
+ GnssLocation Utils::getMockLocation() {
+     ElapsedRealtime elapsedRealtime = {
+             .flags = ElapsedRealtime::HAS_TIMESTAMP_NS | ElapsedRealtime::HAS_TIME_UNCERTAINTY_NS,
+             .timestampNs = ::android::elapsedRealtimeNano(),
+@@ -279,11 +314,13 @@
+                              .horizontalAccuracyMeters = kMockHorizontalAccuracyMeters,
+                              .verticalAccuracyMeters = kMockVerticalAccuracyMeters,
+                              .speedAccuracyMetersPerSecond = kMockSpeedAccuracyMetersPerSecond,
+                              .bearingAccuracyDegrees = kMockBearingAccuracyDegrees,
+-                             .timestampMillis = static_cast<int64_t>(
+-                                     kMockTimestamp + ::android::elapsedRealtimeNano() / 1e6),
++                             // UTC timestamps date a fix. Elapsed realtime above independently
++                             // measures its age across wall-clock adjustments and suspend.
++                             .timestampMillis = nanoseconds_to_milliseconds(systemTime(SYSTEM_TIME_REALTIME)),
+                              .elapsedRealtime = elapsedRealtime};
++    applyWaydroidPosition(location);
+     return location;
+ }
+
+ V2_0::GnssLocation Utils::getMockLocationV2_0() {
+@@ -313,9 +350,9 @@
+             .verticalAccuracyMeters = kMockVerticalAccuracyMeters,
+             .speedAccuracyMetersPerSecond = kMockSpeedAccuracyMetersPerSecond,
+             .bearingAccuracyDegrees = kMockBearingAccuracyDegrees,
+             .timestamp =
+-                    static_cast<int64_t>(kMockTimestamp + ::android::elapsedRealtimeNano() / 1e6)};
++                    nanoseconds_to_milliseconds(systemTime(SYSTEM_TIME_REALTIME))};
+     return location;
+ }
+
+ namespace {
